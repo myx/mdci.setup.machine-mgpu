@@ -1,0 +1,14 @@
+#!/bin/sh
+# One-command overview: the model daemon, the GPU, and the pulled models.
+echo "== model daemon =="
+systemctl is-active mdci-llm.service 2>&1 || true
+echo "== gateway =="
+systemctl is-active nginx 2>&1 || true
+echo "== accelerator =="
+case "${MDCI_ACCELERATOR:-nvidia}" in
+	nvidia) nvidia-smi 2>&1 || echo "nvidia-smi unavailable" ;;
+	amd) rocm-smi 2>&1 || echo "rocm-smi unavailable (planned)" ;;
+	*) echo "unknown accelerator: ${MDCI_ACCELERATOR}" ;;
+esac
+echo "== models =="
+curl -fsS --max-time 10 http://127.0.0.1:11434/api/tags 2>/dev/null | jq -r '.models[]?.name' 2>/dev/null || echo "(daemon not answering)"

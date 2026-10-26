@@ -1,0 +1,3 @@
+#!/bin/sh
+# The model daemon's recent log.
+journalctl -u mdci-llm.service -n "${1:-50}" --no-pager 2>/dev/null || echo "(journald unavailable)"

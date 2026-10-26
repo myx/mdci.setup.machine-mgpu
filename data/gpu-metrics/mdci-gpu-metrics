@@ -1,0 +1,47 @@
+#!/bin/sh
+# MDCI GPU metric collector — Prometheus textfile exporter.
+# Branches on MDCI_ACCELERATOR: nvidia-smi now, rocm-smi when the AMD provider
+# lands. Emits metrics to a node_exporter textfile directory.
+
+if [ -f /etc/mdci-gpu-metrics.env ]; then
+	. /etc/mdci-gpu-metrics.env
+fi
+
+ACCELERATOR="${MDCI_ACCELERATOR:-nvidia}"
+TEXTFILE_DIR="${MDCI_GPU_TEXTFILE_DIR:-/var/lib/node_exporter/textfile_collector}"
+
+mkdir -p "${TEXTFILE_DIR}"
+out="${TEXTFILE_DIR}/.gpu.prom.$$"
+: > "$out"
+
+case "${ACCELERATOR}" in
+	nvidia)
+		if ! command -v nvidia-smi >/dev/null 2>&1; then
+			echo "gpu_up 0" >> "$out"
+		else
+			echo "gpu_up 1" >> "$out"
+			nvidia-smi \
+				--query-gpu=index,utilization.gpu,memory.used,memory.total,temperature.gpu \
+				--format=csv,noheader,nounits \
+			| awk -F', *' '
+				{
+					printf "gpu_utilization_percent{gpu=\"%s\"} %s\n", $1, $2
+					printf "gpu_memory_used_mib{gpu=\"%s\"} %s\n", $1, $3
+					printf "gpu_memory_total_mib{gpu=\"%s\"} %s\n", $1, $4
+					printf "gpu_temperature_celsius{gpu=\"%s\"} %s\n", $1, $5
+				}' >> "$out"
+		fi
+		;;
+	amd)
+		# rocm-smi — planned but postponed (AMD/ROCm provider is a later slice).
+		echo "# rocm-smi collector is planned (AMD provider); not implemented yet" >> "$out"
+		echo "gpu_up 0" >> "$out"
+		;;
+	*)
+		echo "ERROR: unknown MDCI_ACCELERATOR='${ACCELERATOR}' (expected nvidia|amd)" >&2
+		rm -f "$out"
+		exit 1
+		;;
+esac
+
+mv -f "$out" "${TEXTFILE_DIR}/gpu.prom"

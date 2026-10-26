@@ -1,0 +1,23 @@
+#!/bin/sh
+
+# GPU metric collector: install the collector script, its cron entry and the
+# persisted /etc/mdci-gpu-metrics.env. The script itself branches on
+# $MDCI_ACCELERATOR (nvidia-smi now, rocm-smi when the AMD provider lands).
+
+GPU_METRICS_PATH="${MDCI_FILES_PATH}/gpu-metrics"
+
+if [ -d "${GPU_METRICS_PATH}" ]; then
+	install -m 755 "${GPU_METRICS_PATH}/mdci-gpu-metrics" /usr/local/sbin/mdci-gpu-metrics
+	install -m 644 "${GPU_METRICS_PATH}/mdci-gpu-metrics.cron" /etc/cron.d/mdci-gpu-metrics
+
+	# Persist the accelerator choice for the collector: cron runs with a minimal
+	# environment, so the install-time context variable must be written to disk.
+	cat > /etc/mdci-gpu-metrics.env <<- EOF
+		MDCI_ACCELERATOR="${MDCI_ACCELERATOR:-nvidia}"
+		MDCI_GPU_TEXTFILE_DIR="/var/lib/node_exporter/textfile_collector"
+	EOF
+	chmod 644 /etc/mdci-gpu-metrics.env
+
+	# Warm-up run. The collector is a no-op when the driver is not ready yet.
+	/usr/local/sbin/mdci-gpu-metrics || true
+fi

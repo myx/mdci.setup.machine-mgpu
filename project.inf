@@ -1,0 +1,46 @@
+Name: setup.machine-mgpu
+Requires: \
+	standard/setup.machine-ubuntu \
+	
+
+Provides: \
+	standard/setup.machine-mgpu \
+	\
+	image-install:exec-update-before:host/install/standard-mgpu-machine.0.prepare.txt \
+	image-install:exec-update-before:host/install/standard-mgpu-machine.1.accelerator.txt \
+	image-install:exec-update-before:host/install/standard-mgpu-machine.1.firewall-acl.txt \
+	image-install:exec-update-before:host/install/standard-mgpu-machine.1.gpu-metric-collector.txt \
+	image-install:exec-update-before:host/install/standard-mgpu-machine.1.cli-service-ssh.txt \
+	image-install:exec-update-before:host/install/standard-mgpu-machine.1.model-api-gateway.txt \
+	image-install:exec-update-before:host/install/standard-mgpu-machine.2.model-daemon.txt \
+	\
+	image-install:context-variable:MDCI_ACCELERATOR:define:nvidia \
+	image-install:context-variable:MDCI_MODEL:define: \
+	image-install:context-variable:MDCI_MODEL_ADDR:define:127.0.0.1:11434 \
+	image-install:context-variable:MDCI_SSH_PORT:define:22022 \
+	image-install:context-variable:MDCI_GATEWAY_PORT:define:8443 \
+	image-install:context-variable:MDCI_HOST:define: \
+	image-install:context-variable:MDCI_RIG_IP:define: \
+	image-install:context-variable:MDCI_API_KEY:define: \
+	image-install:context-variable:MDCI_LETSENCRYPT_EMAIL:define: \
+	image-install:context-variable:MDCI_NVIDIA_CUDA_SUITE:define:ubuntu2404 \
+	image-install:context-variable:MDCI_NVIDIA_PIN_BRANCH:define:590 \
+	\
+	image-prepare:sync-source-files:*:data/gpu-metrics:gpu-metrics \
+	image-install:deploy-sync-files:gpu-metrics:/usr/local/mdci-files/gpu-metrics \
+	\
+	image-prepare:sync-source-files:*:data/cli-service:cli-service \
+	image-install:deploy-sync-files:cli-service:/usr/local/mdci-files/cli-service \
+	\
+	image-prepare:sync-source-files:*:data/nginx:nginx \
+	image-install:deploy-sync-files:nginx:/usr/local/mdci-files/nginx \
+
+Keywords: \
+	ubuntu \
+	ubuntu-machine \
+	mgpu \
+	gpu \
+	nvidia \
+	cuda \
+	llm \
+	model \

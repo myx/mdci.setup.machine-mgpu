@@ -1,0 +1,7 @@
+#!/bin/sh
+# The GPU, by the accelerator.
+case "${MDCI_ACCELERATOR:-nvidia}" in
+	nvidia) nvidia-smi ;;
+	amd) rocm-smi ;;
+	*) echo "unknown accelerator: ${MDCI_ACCELERATOR}" >&2; exit 1 ;;
+esac

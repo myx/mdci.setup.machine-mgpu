@@ -1,0 +1,3 @@
+#!/bin/sh
+# The models currently pulled.
+curl -fsS --max-time 10 http://127.0.0.1:11434/api/tags | jq -r '.models[]?.name' 2>/dev/null

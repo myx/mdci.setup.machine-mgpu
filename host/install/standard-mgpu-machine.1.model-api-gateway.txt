@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -ex
+test "$(id -u)" -eq 0 || { echo 'ERROR: Must be root!' >&2; exit 1; }
+
+# Model API gateway: a TLS reverse proxy (nginx) in front of Ollama's loopback
+# OpenAI-compatible API, with a bearer token and an IP ACL. Fully automated.
+
+HOST="${MDCI_HOST:?MDCI_HOST must name the public hostname of this machine}"
+KEY="${MDCI_API_KEY:?MDCI_API_KEY must be the rig bearer token (deferred secret)}"
+GATEWAY_PORT="${MDCI_GATEWAY_PORT:-8443}"
+
+# The token is a bearer secret: refuse a weak one rather than accept it.
+if [ "${#KEY}" -lt 32 ]; then
+	echo 'ERROR: MDCI_API_KEY must be a high-entropy secret of at least 32 characters' >&2
+	exit 1
+fi
+GATEWAY_DIR="${MDCI_FILES_PATH:-/usr/local/mdci-files}"
+
+DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y nginx certbot python3-certbot-nginx
+
+# render the gateway config with this machine's host/port/key
+install -d -m 750 /etc/nginx/sites-available /etc/nginx/sites-enabled
+sed -e "s|__MDCI_API_KEY__|${KEY}|g" \
+    -e "s|__MDCI_HOST__|${HOST}|g" \
+    -e "s|__MDCI_GATEWAY_PORT__|${GATEWAY_PORT}|g" \
+    "${GATEWAY_DIR}/nginx/mdci-model-gateway.conf" > /etc/nginx/sites-available/mdci-model-gateway
+ln -sf /etc/nginx/sites-available/mdci-model-gateway /etc/nginx/sites-enabled/mdci-model-gateway
+
+# The rendered config holds the bearer token: root-only, never world-readable.
+chmod 600 /etc/nginx/sites-available/mdci-model-gateway
+
+# remove any default server that would answer on the gateway port
+rm -f /etc/nginx/sites-enabled/default
+
+# provision the TLS cert (Let's Encrypt) and reload nginx with it
+certbot --nginx -d "${HOST}" --non-interactive --agree-tos --redirect -m "${MDCI_LETSENCRYPT_EMAIL:?MDCI_LETSENCRYPT_EMAIL must be set}" || {
+    echo 'ERROR: certbot could not provision TLS for the gateway' >&2
+    exit 1
+}
+nginx -t
+systemctl enable --now nginx

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -ex
+test "$(id -u)" -eq 0 || { echo 'ERROR: Must be root!' >&2; exit 1; }
+
+# The accelerator: chosen by MDCI_ACCELERATOR (declared in setup.machine-mgpu's
+# project.inf, overridden by the instance). nvidia now; amd planned, not yet here.
+
+case "${MDCI_ACCELERATOR:-nvidia}" in
+	nvidia)
+		# NVIDIA driver + CUDA toolkit -- headless compute-only (no display stack).
+		CUDA_SUITE="${MDCI_NVIDIA_CUDA_SUITE:-ubuntu2404}"
+		PIN_BRANCH="${MDCI_NVIDIA_PIN_BRANCH:-590}"
+
+		DEBIAN_FRONTEND=noninteractive apt-get update
+		# linux headers required by nvidia-dkms
+		DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y "linux-headers-$(uname -r)"
+
+		# NVIDIA CUDA apt keyring (public NVIDIA key)
+		tmpdir="$(mktemp -d)"
+		trap 'rm -rf "$tmpdir"' EXIT
+		wget -q -P "$tmpdir" "https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_SUITE}/x86_64/cuda-keyring_1.1-1_all.deb"
+		dpkg -i "${tmpdir}/cuda-keyring_1.1-1_all.deb"
+		DEBIAN_FRONTEND=noninteractive apt-get update
+
+		# pin the driver branch before installing, so it cannot jump branches
+		DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y "nvidia-driver-pinning-${PIN_BRANCH}"
+
+		# headless compute-only driver: no display stack
+		DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y libnvidia-compute nvidia-dkms
+
+		# CUDA toolkit (nvcc etc.) -- build toolchain; inference-only hosts may skip it
+		DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y cuda-toolkit
+
+		nvidia-smi
+	;;
+	amd)
+		# PLANNED, NOT YET IMPLEMENTED: AMD ROCm (rocm-smi) on Ubuntu.
+		echo 'ERROR: MDCI_ACCELERATOR=amd is planned but not yet implemented (ROCm provider)' >&2
+		exit 1
+	;;
+	*)
+		echo "ERROR: unknown MDCI_ACCELERATOR '${MDCI_ACCELERATOR}' (nvidia | amd)" >&2
+		exit 1
+	;;
+esac

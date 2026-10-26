@@ -1,0 +1,5 @@
+#!/bin/sh
+# Pull (or update) a model. mgpu-model-pull <model-tag>
+set -e
+TAG="${1:?usage: mgpu-model-pull <model-tag>}"
+sudo -u mdci-llm ollama pull "$TAG"

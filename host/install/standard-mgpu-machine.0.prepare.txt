@@ -1,0 +1,5 @@
+#!/bin/sh
+
+# No-op: the Ubuntu floor (standard/setup.machine-ubuntu) already ran via
+# Requires. This step exists only to give setup.machine-mgpu its own .0
+# prepare slot in the install sequence.

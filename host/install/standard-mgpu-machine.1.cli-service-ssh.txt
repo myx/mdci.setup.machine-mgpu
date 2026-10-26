@@ -1,0 +1,44 @@
+#!/bin/sh
+
+# CLI service over SSH: a dedicated non-root user whose SSH login is a
+# ForceCommand allowlist. The allowlist script (data/cli-service/mdci-llm-cli.sh)
+# runs only a fixed set of model/read-only commands; everything else is logged
+# and denied.
+
+CLI_USER="mdci-cli"
+CLI_HOME="/var/lib/${CLI_USER}"
+CLI_SERVICE_PATH="${MDCI_FILES_PATH}/cli-service"
+
+myx.common lib/installUser "$CLI_USER" "MDCI LLM CLI service user" 582 "${CLI_HOME}"
+
+if [ -d "${CLI_SERVICE_PATH}" ]; then
+	install -m 755 "${CLI_SERVICE_PATH}/mdci-llm-cli.sh" /usr/local/bin/mdci-llm-cli.sh
+
+	# Persist the model and loopback address for the allowlist script: the SSH
+	# ForceCommand runs with a minimal environment, so the install-time values
+	# must be written to disk (as the metric collector does for the accelerator).
+	cat > /etc/mdci-llm-cli.env <<- EOF
+		MDCI_MODEL="${MDCI_MODEL:?MDCI_MODEL must name the model tag (the instance sets it)}"
+		MDCI_MODEL_ADDR="${MDCI_MODEL_ADDR:-127.0.0.1:11434}"
+	EOF
+	chmod 644 /etc/mdci-llm-cli.env
+
+	mkdir -p "${CLI_HOME}/.ssh"
+	chmod 700 "${CLI_HOME}/.ssh"
+	chown "${CLI_USER}:${CLI_USER}" "${CLI_HOME}/.ssh"
+
+	# The public key is a deferred secret: it is never committed, and the
+	# instance supplies it as MDCI_AGENT_PKEY at deploy time. When absent, the
+	# account exists but no key can log in.
+	if [ -n "${MDCI_AGENT_PKEY:-}" ]; then
+		keyline="command=\"/usr/local/bin/mdci-llm-cli.sh\",restrict,no-agent-forwarding ${MDCI_AGENT_PKEY}"
+		myx.common lib/replaceLine \
+			"${CLI_HOME}/.ssh/authorized_keys" \
+			"^command=.*mdci-llm-cli" \
+			"${keyline}"
+		chmod 600 "${CLI_HOME}/.ssh/authorized_keys"
+		chown "${CLI_USER}:${CLI_USER}" "${CLI_HOME}/.ssh/authorized_keys"
+	else
+		echo "NOTE: MDCI_AGENT_PKEY not set — CLI-service SSH key not installed (deferred secret)." >&2
+	fi
+fi

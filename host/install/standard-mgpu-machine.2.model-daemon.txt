@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -ex
+test "$(id -u)" -eq 0 || { echo 'ERROR: Must be root!' >&2; exit 1; }
+
+MODEL_USER="mdci-llm"
+MODEL_HOME="/var/lib/${MODEL_USER}"
+
+# dedicated non-root service user
+myx.common lib/installUser "$MODEL_USER" "MDCI LLM model daemon user" 581 "${MODEL_HOME}"
+
+# GPU access: the NVIDIA driver owns /dev/nvidia* via the video/render groups.
+for grp in render video; do
+	if getent group "$grp" >/dev/null 2>&1; then
+		usermod -aG "$grp" "$MODEL_USER" || true
+	fi
+done
+
+# model storage
+install -d -o "$MODEL_USER" -g "$MODEL_USER" -m 750 "${MODEL_HOME}/models"
+
+# model runtime — Ollama is the reference daemon; the unit sets OLLAMA_HOST to
+# the loopback address. Its own ollama.service is disabled in favour of the
+# mdci-llm.service unit shipped via the os-services-systemd contract.
+if ! command -v ollama >/dev/null 2>&1; then
+	curl -fsSL https://ollama.com/install.sh | sh
+	systemctl disable --now ollama.service 2>/dev/null || true
+fi
+
+# the unit was synced + enabled by the ubuntu floor's os-services-systemd step
+systemctl daemon-reload
+systemctl enable --now mdci-llm.service
+
+# Wait for the daemon's loopback API to answer, then pull the model so the
+# machine is actually usable — not a manual post-deploy step. The pull is a
+# large download; it is retried a few times so a transient network drop does
+# not leave the machine with a running daemon and no model.
+MODEL_TAG="${MDCI_MODEL:?MDCI_MODEL must name the model tag to pull (the instance sets it)}"
+for i in $(seq 1 60); do
+	if curl -fsS http://127.0.0.1:11434/api/version >/dev/null 2>&1; then break; fi
+	sleep 2
+done
+if ! curl -fsS http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
+	echo "ERROR: mdci-llm daemon did not answer on 127.0.0.1:11434 — cannot pull the model" >&2
+	exit 1
+fi
+for attempt in 1 2 3; do
+	if sudo -u "$MODEL_USER" ollama pull "$MODEL_TAG"; then break; fi
+	echo "WARNING: ollama pull '$MODEL_TAG' attempt $attempt failed — retrying" >&2
+	sleep 10
+	[ "$attempt" -lt 3 ] || { echo "ERROR: could not pull the model '$MODEL_TAG'" >&2; exit 1; }
+done

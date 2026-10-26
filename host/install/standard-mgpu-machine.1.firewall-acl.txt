@@ -1,0 +1,34 @@
+#!/bin/sh
+set -e
+
+# WAN host hardening: allocated SSH port + policy-drop firewall, fully automated.
+# The ports and the rig ACL arrive as context-variables (set by the instance);
+# they are substituted into the deployed drop-in before the atomic apply.
+
+SSH_PORT="${MDCI_SSH_PORT:-22022}"
+GATEWAY_PORT="${MDCI_GATEWAY_PORT:-8443}"
+RIG_IP="${MDCI_RIG_IP:-}"
+
+# Move sshd to the allocated port.
+if grep -qE '^[[:space:]]*#?[[:space:]]*Port[[:space:]]' /etc/ssh/sshd_config; then
+	sed -i -E "s|^[[:space:]]*#?[[:space:]]*Port[[:space:]].*|Port ${SSH_PORT}|" /etc/ssh/sshd_config
+else
+	echo "Port ${SSH_PORT}" >> /etc/ssh/sshd_config
+fi
+service ssh reload
+
+# Fill the firewall placeholders. The gateway opens only to the rig IPs; with no
+# rig IPs set, the gateway rule is removed, so the model stays unreachable.
+if [ -f /etc/nftables.conf ]; then
+	sed -i -e "s|__MDCI_SSH_PORT__|${SSH_PORT}|g" -e "s|__MDCI_GATEWAY_PORT__|${GATEWAY_PORT}|g" /etc/nftables.conf
+	if [ -n "$RIG_IP" ]; then
+		sed -i -e "s|__MDCI_RIG_IP__|${RIG_IP}|g" /etc/nftables.conf
+	else
+		sed -i -e "/model API gateway/d" /etc/nftables.conf
+	fi
+fi
+
+# Apply the policy-drop ruleset, atomically. established+related keeps this
+# session; a ruleset that fails to parse leaves the previous one untouched.
+systemctl enable --now nftables.service
+nft -f /etc/nftables.conf
