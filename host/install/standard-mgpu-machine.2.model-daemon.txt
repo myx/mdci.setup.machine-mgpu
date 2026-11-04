@@ -5,6 +5,11 @@ test "$(id -u)" -eq 0 || { echo 'ERROR: Must be root!' >&2; exit 1; }
 MODEL_USER="mdci-llm"
 MODEL_HOME="/var/lib/${MODEL_USER}"
 
+# The floor enables every unit it syncs, before any step has created the user this
+# unit names. A unit whose user is absent restarts forever, so stop it first and
+# start it again once the account and the runtime exist.
+systemctl stop mdci-llm.service 2> /dev/null || true
+
 # dedicated non-root service user
 myx.common lib/installUser "$MODEL_USER" "MDCI LLM model daemon user" 581 "${MODEL_HOME}"
 

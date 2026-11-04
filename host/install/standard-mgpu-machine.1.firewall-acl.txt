@@ -19,6 +19,15 @@ service ssh reload
 
 # Fill the firewall placeholders. The gateway opens only to the rig IPs; with no
 # rig IPs set, the gateway rule is removed, so the model stays unreachable.
+# The template itself is copied by a later fragment, so copy it here first: the
+# fill has nothing to act on until the placeholders exist on disk.
+NFTABLES_TEMPLATE="${MDCI_FILES_PATH:-/usr/local/mdci-files}/nftables.conf/nftables.conf"
+if [ -s "$NFTABLES_TEMPLATE" ]; then
+	cp -f "$NFTABLES_TEMPLATE" /etc/nftables.conf
+	chown root:root /etc/nftables.conf
+	chmod u=rw,go=r /etc/nftables.conf
+fi
+
 if [ -f /etc/nftables.conf ]; then
 	sed -i -e "s|__MDCI_SSH_PORT__|${SSH_PORT}|g" -e "s|__MDCI_GATEWAY_PORT__|${GATEWAY_PORT}|g" /etc/nftables.conf
 	if [ -n "$RIG_IP" ]; then
@@ -26,6 +35,14 @@ if [ -f /etc/nftables.conf ]; then
 	else
 		sed -i -e "/model API gateway/d" /etc/nftables.conf
 	fi
+fi
+
+# A placeholder left in the file is a ruleset that will not load: refuse before
+# applying, so a broken apply cannot lock the machine out of its own network.
+if grep -q '__MDCI_' /etc/nftables.conf ; then
+	echo 'ERROR: unresolved placeholder in /etc/nftables.conf; refusing to apply the firewall' >&2
+	grep -n '__MDCI_' /etc/nftables.conf >&2
+	exit 1
 fi
 
 # Apply the policy-drop ruleset, atomically. established+related keeps this

@@ -32,10 +32,23 @@ chmod 600 /etc/nginx/sites-available/mdci-model-gateway
 # remove any default server that would answer on the gateway port
 rm -f /etc/nginx/sites-enabled/default
 
-# provision the TLS cert (Let's Encrypt) and reload nginx with it
-certbot --nginx -d "${HOST}" --non-interactive --agree-tos --redirect -m "${MDCI_LETSENCRYPT_EMAIL:?MDCI_LETSENCRYPT_EMAIL must be set}" || {
-    echo 'ERROR: certbot could not provision TLS for the gateway' >&2
-    exit 1
-}
+# The auth map's key is the whole "Bearer <token>" string, which is longer than
+# nginx's default 64-byte hash bucket, so the config fails to load without this.
+grep -q 'map_hash_bucket_size' /etc/nginx/nginx.conf || \
+	sed -i 's|^http {|http {\n\tmap_hash_bucket_size 128;|' /etc/nginx/nginx.conf
+
+# Provision the TLS certificate. http-01 needs inbound 80 and the name pointing
+# at this machine, which a host behind a router at another location cannot
+# guarantee. When certbot cannot complete, keep a self-signed certificate so the
+# gateway still serves over TLS, and say so: a client must then pin or skip it.
+CERT_DIR="/etc/letsencrypt/live/${HOST}"
+if ! certbot --nginx -d "${HOST}" --non-interactive --agree-tos --redirect -m "${MDCI_LETSENCRYPT_EMAIL:?MDCI_LETSENCRYPT_EMAIL must be set}" ; then
+	echo "WARNING: certbot could not provision TLS for ${HOST}; falling back to a self-signed certificate" >&2
+	install -d -m 750 "$CERT_DIR"
+	openssl req -x509 -nodes -newkey rsa:2048 -days 90 \
+		-subj "/CN=${HOST}" -addext "subjectAltName=DNS:${HOST}" \
+		-keyout "$CERT_DIR/privkey.pem" -out "$CERT_DIR/fullchain.pem"
+	chmod 600 "$CERT_DIR/privkey.pem"
+fi
 nginx -t
 systemctl enable --now nginx
