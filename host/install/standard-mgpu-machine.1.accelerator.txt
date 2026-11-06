@@ -12,8 +12,23 @@ case "${MDCI_ACCELERATOR:-nvidia}" in
 		PIN_BRANCH="${MDCI_NVIDIA_PIN_BRANCH:-590}"
 
 		DEBIAN_FRONTEND=noninteractive apt-get update
-		# linux headers required by nvidia-dkms
-		DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y "linux-headers-$(uname -r)"
+		# A build that failed on an earlier run leaves nvidia-dkms half configured. Every later
+		# apt call then fails before it starts, including the one that would fetch the compiler.
+		# Clearing that state first is what makes a second run of this installer recover.
+		brokenNvidia="$( dpkg -l 2> /dev/null | awk '$1 !~ /^(ii|un)$/ && $2 ~ /^nvidia-/ { print $2 }' | tr "\n" " " )"
+		if [ -n "${brokenNvidia}" ] ; then
+			echo "accelerator: clearing the half-configured packages an earlier failed build left: ${brokenNvidia}" >&2
+			DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq ${brokenNvidia} > /dev/null 2>&1 || :
+			DEBIAN_FRONTEND=noninteractive dpkg --configure -a > /dev/null 2>&1 || :
+		fi
+		# nvidia-dkms builds a module, so it needs a C compiler and the kernel headers.
+		# A bare Ubuntu image has make and dkms but no compiler: DKMS then fails its own
+		# CC sanity check and the build stops with nothing installed.
+		# The headers go in for every installed generic kernel, not only the running one,
+		# because nvidia-dkms builds for each kernel it finds headers for. Without that, a
+		# host that boots a newer kernel has no driver module for it.
+		DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
+			build-essential "linux-headers-$(uname -r)" linux-headers-generic
 
 		# NVIDIA CUDA apt keyring (public NVIDIA key)
 		tmpdir="$(mktemp -d)"
@@ -25,11 +40,71 @@ case "${MDCI_ACCELERATOR:-nvidia}" in
 		# pin the driver branch before installing, so it cannot jump branches
 		DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y "nvidia-driver-pinning-${PIN_BRANCH}"
 
-		# headless compute-only driver: no display stack
-		DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y libnvidia-compute nvidia-dkms
+		# headless compute-only driver: no display stack. A build that fails here is not the
+		# answer: the card check below is, and it installs the open modules when the
+		# proprietary ones cannot drive the card.
+		DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y libnvidia-compute nvidia-dkms || \
+			echo "accelerator: the pinned driver did not build on this kernel; the card check below decides" >&2
+
+		# A CARD ANOTHER DRIVER ALREADY OWNS IS NOT HANDED OVER ON REQUEST. A bare Ubuntu image
+		# boots with nouveau, which binds the GPU. nvidia then cannot probe and reports "No NVIDIA
+		# devices probed", on a driver that is installed and built correctly. `modprobe -r nouveau`
+		# does not undo it: nvidia's own modprobe.d file aliases `nouveau` to `off`, so modprobe
+		# resolves that name, finds no module, and exits 0 having done nothing. rmmod removes the
+		# loaded module itself, which is what puts the card back up for grabs.
+		MdciReleaseCardFromNouveau() {
+			if ! lsmod | awk 'NR > 1 { print $1 }' | grep -qx 'nouveau' ; then return 0 ; fi
+			echo 'accelerator: the kernel default driver holds this GPU; releasing it before the nvidia module loads' >&2
+			rmmod nouveau 2> /dev/null || :
+			sleep 1
+			if lsmod | awk 'NR > 1 { print $1 }' | grep -qx 'nouveau' ; then
+				echo 'WARNING: nouveau is still loaded; the nvidia module is loaded anyway and the card check below decides' >&2
+			fi
+		}
+		MdciReleaseCardFromNouveau
 
 		# CUDA toolkit (nvcc etc.) -- build toolchain; inference-only hosts may skip it
 		DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y cuda-toolkit
+
+		# THE CARD DECIDES. Blackwell-class GPUs (RTX PRO 6000, PCI 10de:2bb4) REFUSE the
+		# proprietary module at load -- "requires use of the NVIDIA open kernel modules",
+		# RmInitAdapter failed -- so nvidia-smi reports "No devices were found" on a driver
+		# that is installed correctly. The open modules of the same branch drive those cards.
+		# The probe is nvidia-smi itself: if the pinned driver cannot see the GPU, the open
+		# modules of the same branch are installed and the check is made once more.
+		if ! nvidia-smi > /dev/null 2>&1 ; then
+			echo "accelerator: the pinned driver cannot drive this GPU, switching to the open modules of branch ${PIN_BRANCH}" >&2
+			DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
+				"nvidia-dkms-${PIN_BRANCH}-open" "libnvidia-compute-${PIN_BRANCH}" "nvidia-utils-${PIN_BRANCH}" || :
+			DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq $( dpkg -l | awk '/^ii/ && $2 ~ /^(libnvidia|nvidia)-(common|compute|gl|decode|encode|fbc|kernel-common|kernel-source|modprobe)/ {print $2}' | tr "\n" " " ) > /dev/null 2>&1 || :
+			DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
+				"nvidia-dkms-${PIN_BRANCH}-open" "libnvidia-compute-${PIN_BRANCH}" "nvidia-utils-${PIN_BRANCH}" || :
+			dkms autoinstall > /dev/null 2>&1 || :
+			MdciReleaseCardFromNouveau
+			# Reload every dependent first: a module still in use keeps the old build loaded.
+			modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia 2> /dev/null || :
+			modprobe nvidia 2> /dev/null || :
+			modprobe nvidia_uvm 2> /dev/null || :
+		fi
+
+		# Every kernel that has headers gets the module, so the host boots the driver on whichever
+		# kernel it comes up in. This covers the open-module branch above and the running one both.
+		# The reboot is not this fragment's business: it runs in the middle of the deploy, and
+		# cutting the deploy there would leave the later fragments unrun.
+		dkms autoinstall > /dev/null 2>&1 || :
+		if ! nvidia-smi > /dev/null 2>&1 ; then
+			MdciReleaseCardFromNouveau
+			modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia 2> /dev/null || :
+			modprobe nvidia 2> /dev/null || :
+		fi
+
+		# THE CARD DECIDES, so the deploy does too: a driver that cannot see the GPU fails here,
+		# naming the state, rather than passing and leaving a host that looks deployed.
+		if ! nvidia-smi > /dev/null 2>&1 ; then
+			echo 'ERROR: the installed driver cannot see the GPU; nvidia-smi failed after the open-module install' >&2
+			nvidia-smi >&2 || true
+			exit 1
+		fi
 
 		nvidia-smi
 	;;

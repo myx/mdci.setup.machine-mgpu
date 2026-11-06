@@ -16,39 +16,85 @@ if [ "${#KEY}" -lt 32 ]; then
 fi
 GATEWAY_DIR="${MDCI_FILES_PATH:-/usr/local/mdci-files}"
 
-DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y nginx certbot python3-certbot-nginx
+DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y nginx certbot
 
-# render the gateway config with this machine's host/port/key
+ACME_ROOT="${MDCI_ACME_ROOT:-/var/www/mdci-acme}"
+install -d -m 755 "${ACME_ROOT}/.well-known/acme-challenge"
+
+# The gateway serves whichever certificate this run ends up with. The self-signed
+# fallback gets its own directory: certbot refuses to write into a live directory
+# it did not create, so a fallback kept under /etc/letsencrypt would block every
+# later real certificate on that host.
+REAL_CERT_DIR="/etc/letsencrypt/live/${HOST}"
+SELF_CERT_DIR="/etc/mdci-tls/${HOST}"
+CERT_DIR="${REAL_CERT_DIR}"
+
+# Serve the challenge on port 80 first. The name reaches this machine through the
+# router's port-80 proxy, so validation never needs the registrar to point the
+# name straight at this host.
 install -d -m 750 /etc/nginx/sites-available /etc/nginx/sites-enabled
+rm -f /etc/nginx/sites-enabled/default
+printf '%s\n' \
+	'server {' \
+	'    listen 80;' \
+	'    listen [::]:80;' \
+	"    server_name ${HOST};" \
+	'    location /.well-known/acme-challenge/ {' \
+	"        root ${ACME_ROOT};" \
+	'        default_type text/plain;' \
+	'    }' \
+	'    location / {' \
+	'        return 404;' \
+	'    }' \
+	'}' > /etc/nginx/sites-available/mdci-acme
+ln -sf /etc/nginx/sites-available/mdci-acme /etc/nginx/sites-enabled/mdci-acme
+nginx -t
+systemctl enable --now nginx
+systemctl reload nginx
+
+# An earlier run could have left its self-signed certificate inside the certbot
+# directory. Move it aside, so certbot is free to create that directory itself.
+if [ -f "${REAL_CERT_DIR}/fullchain.pem" ] ; then
+	issuerHash="$( openssl x509 -noout -issuer_hash -in "${REAL_CERT_DIR}/fullchain.pem" )"
+	subjectHash="$( openssl x509 -noout -subject_hash -in "${REAL_CERT_DIR}/fullchain.pem" )"
+	if [ "${issuerHash}" = "${subjectHash}" ] ; then
+		install -d -m 755 "$( dirname "${SELF_CERT_DIR}" )"
+		mv "${REAL_CERT_DIR}" "${SELF_CERT_DIR}"
+	fi
+fi
+
+# The certificate comes from this machine's own HTTP challenge, not from the
+# router's zone, and the deploy hook reloads nginx so a renewal takes effect.
+if certbot certonly --webroot -w "${ACME_ROOT}" -d "${HOST}" \
+	--non-interactive --agree-tos --deploy-hook 'systemctl reload nginx' \
+	-m "${MDCI_LETSENCRYPT_EMAIL:?MDCI_LETSENCRYPT_EMAIL must be set}" ; then
+	echo "mdci:model-api-gateway: ${HOST} holds a certificate from its own HTTP challenge" >&2
+else
+	echo "WARNING: certbot could not provision TLS for ${HOST}; falling back to a self-signed certificate" >&2
+	CERT_DIR="${SELF_CERT_DIR}"
+	install -d -m 750 "${CERT_DIR}"
+	openssl req -x509 -nodes -newkey rsa:2048 -days 90 \
+		-subj "/CN=${HOST}" -addext "subjectAltName=DNS:${HOST}" \
+		-keyout "${CERT_DIR}/privkey.pem" -out "${CERT_DIR}/fullchain.pem"
+	chmod 600 "${CERT_DIR}/privkey.pem"
+fi
+
+# render the gateway config with this machine's host, port, key and certificate
 sed -e "s|__MDCI_API_KEY__|${KEY}|g" \
     -e "s|__MDCI_HOST__|${HOST}|g" \
     -e "s|__MDCI_GATEWAY_PORT__|${GATEWAY_PORT}|g" \
+    -e "s|__MDCI_CERT_DIR__|${CERT_DIR}|g" \
     "${GATEWAY_DIR}/nginx/mdci-model-gateway.conf" > /etc/nginx/sites-available/mdci-model-gateway
 ln -sf /etc/nginx/sites-available/mdci-model-gateway /etc/nginx/sites-enabled/mdci-model-gateway
 
 # The rendered config holds the bearer token: root-only, never world-readable.
 chmod 600 /etc/nginx/sites-available/mdci-model-gateway
 
-# remove any default server that would answer on the gateway port
-rm -f /etc/nginx/sites-enabled/default
-
 # The auth map's key is the whole "Bearer <token>" string, which is longer than
 # nginx's default 64-byte hash bucket, so the config fails to load without this.
 grep -q 'map_hash_bucket_size' /etc/nginx/nginx.conf || \
 	sed -i 's|^http {|http {\n\tmap_hash_bucket_size 128;|' /etc/nginx/nginx.conf
 
-# Provision the TLS certificate. http-01 needs inbound 80 and the name pointing
-# at this machine, which a host behind a router at another location cannot
-# guarantee. When certbot cannot complete, keep a self-signed certificate so the
-# gateway still serves over TLS, and say so: a client must then pin or skip it.
-CERT_DIR="/etc/letsencrypt/live/${HOST}"
-if ! certbot --nginx -d "${HOST}" --non-interactive --agree-tos --redirect -m "${MDCI_LETSENCRYPT_EMAIL:?MDCI_LETSENCRYPT_EMAIL must be set}" ; then
-	echo "WARNING: certbot could not provision TLS for ${HOST}; falling back to a self-signed certificate" >&2
-	install -d -m 750 "$CERT_DIR"
-	openssl req -x509 -nodes -newkey rsa:2048 -days 90 \
-		-subj "/CN=${HOST}" -addext "subjectAltName=DNS:${HOST}" \
-		-keyout "$CERT_DIR/privkey.pem" -out "$CERT_DIR/fullchain.pem"
-	chmod 600 "$CERT_DIR/privkey.pem"
-fi
+# The port-80 challenge site stays enabled: certbot's own timer renews through it.
 nginx -t
-systemctl enable --now nginx
+systemctl reload nginx

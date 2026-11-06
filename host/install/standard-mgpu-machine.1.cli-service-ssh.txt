@@ -32,7 +32,9 @@ if [ -d "${CLI_SERVICE_PATH}" ]; then
 	# account exists but no key can log in.
 	if [ -n "${MDCI_AGENT_PKEY:-}" ]; then
 		keyline="command=\"/usr/local/bin/mdci-llm-cli.sh\",restrict,no-agent-forwarding ${MDCI_AGENT_PKEY}"
-		myx.common lib/replaceLine \
+		# --create, because a fresh account has no authorized_keys file yet and the fragment
+		# must make one. Without it the call refuses an absent file and the deploy stops here.
+		myx.common lib/replaceLine --create \
 			"${CLI_HOME}/.ssh/authorized_keys" \
 			"^command=.*mdci-llm-cli" \
 			"${keyline}"

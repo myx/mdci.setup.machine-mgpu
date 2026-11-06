@@ -9,13 +9,67 @@ SSH_PORT="${MDCI_SSH_PORT:-22022}"
 GATEWAY_PORT="${MDCI_GATEWAY_PORT:-8443}"
 RIG_IP="${MDCI_RIG_IP:-}"
 
-# Move sshd to the allocated port.
-if grep -qE '^[[:space:]]*#?[[:space:]]*Port[[:space:]]' /etc/ssh/sshd_config; then
-	sed -i -E "s|^[[:space:]]*#?[[:space:]]*Port[[:space:]].*|Port ${SSH_PORT}|" /etc/ssh/sshd_config
+# Move sshd to the allocated port, and never strand the host while doing it.
+# Ubuntu 22.10 and later socket-activate sshd: systemd owns the listening socket,
+# and a `Port` line in sshd_config is then ignored. So the port goes wherever this
+# host actually reads it, and the proof afterwards is a listener, not a config line.
+SSHD_DROPIN_DIR=/etc/ssh/sshd_config.d
+SSHD_MAIN=/etc/ssh/sshd_config
+SOCKET_DROPIN_DIR=/etc/systemd/system/ssh.socket.d
+SSHD_BACKUP="$( mktemp /etc/ssh/sshd_config.mdci-backup.XXXXXX )"
+cp -p "$SSHD_MAIN" "$SSHD_BACKUP"
+
+# Put the host back exactly as it was. Every call site of this runs before the
+# ruleset is applied, so a restored sshd is one the operator can still reach.
+MdciRestoreSshd() {
+	cp -p "$SSHD_BACKUP" "$SSHD_MAIN"
+	rm -f "${SSHD_DROPIN_DIR}/00-mdci-port.conf"
+	rm -f "${SOCKET_DROPIN_DIR}/10-mdci-port.conf"
+	systemctl daemon-reload
+	if systemctl is-enabled --quiet ssh.socket 2> /dev/null ; then
+		systemctl restart ssh.socket || :
+	else
+		systemctl restart ssh 2> /dev/null || service ssh restart || :
+	fi
+	rm -f "$SSHD_BACKUP"
+}
+
+install -d -m 755 "$SSHD_DROPIN_DIR"
+printf 'Port %s\n' "${SSH_PORT}" > "${SSHD_DROPIN_DIR}/00-mdci-port.conf"
+chmod 644 "${SSHD_DROPIN_DIR}/00-mdci-port.conf"
+sed -i -E 's|^[[:space:]]*Port[[:space:]]+[0-9]+.*|# mdci: the port is set in sshd_config.d/00-mdci-port.conf|' "$SSHD_MAIN"
+
+if systemctl is-enabled --quiet ssh.socket 2> /dev/null ; then
+	install -d -m 755 "$SOCKET_DROPIN_DIR"
+	printf '%s\n' '[Socket]' 'ListenStream=' "ListenStream=${SSH_PORT}" > "${SOCKET_DROPIN_DIR}/10-mdci-port.conf"
+	systemctl daemon-reload
+	if ! sshd -t ; then
+		MdciRestoreSshd
+		echo "ERROR: sshd rejected the configuration carrying Port ${SSH_PORT}; the previous one is restored and the firewall is not applied" >&2
+		exit 1
+	fi
+	systemctl restart ssh.socket
 else
-	echo "Port ${SSH_PORT}" >> /etc/ssh/sshd_config
+	if ! sshd -t ; then
+		MdciRestoreSshd
+		echo "ERROR: sshd rejected the configuration carrying Port ${SSH_PORT}; the previous one is restored and the firewall is not applied" >&2
+		exit 1
+	fi
+	systemctl restart ssh 2> /dev/null || service ssh restart
 fi
-service ssh reload
+
+listening=""
+for _ in $(seq 1 20) ; do
+	if ss -lnt "sport = :${SSH_PORT}" | awk 'NR>1' | grep -q . ; then listening=yes ; break ; fi
+	sleep 1
+done
+if [ -z "$listening" ] ; then
+	MdciRestoreSshd
+	echo "ERROR: sshd is not listening on ${SSH_PORT} after the restart; the previous configuration is restored and the firewall is not applied" >&2
+	sshd -T 2>&1 | grep -i '^port' >&2
+	exit 1
+fi
+rm -f "$SSHD_BACKUP"
 
 # Fill the firewall placeholders. The gateway opens only to the rig IPs; with no
 # rig IPs set, the gateway rule is removed, so the model stays unreachable.
