@@ -20,37 +20,212 @@ for grp in render video; do
 	fi
 done
 
-# model storage
-install -d -o "$MODEL_USER" -g "$MODEL_USER" -m 750 "${MODEL_HOME}/models"
+# model runtime — MDCI_MODEL_RUNTIME selects the branch, as MDCI_ACCELERATOR selects
+# one in 1.accelerator. The unit has one ExecStart, the dispatcher below, so the
+# runtime lives in /etc/mdci-llm-runtime.env and a host's state cannot disagree with
+# its unit after a reboot. Neither branch prunes the other's weights, so rollback is
+# that file plus a restart and the old model stays where it is.
+RUNTIME_FILES="${MDCI_FILES_PATH:-/usr/local/mdci-files}/model-runtime"
+MODEL_ADDR="${MDCI_MODEL_ADDR:-127.0.0.1:11434}"
+install -m 755 "${RUNTIME_FILES}/mdci-llm-run" /usr/local/bin/mdci-llm-run
 
-# model runtime — Ollama is the reference daemon; the unit sets OLLAMA_HOST to
-# the loopback address. Its own ollama.service is disabled in favour of the
-# mdci-llm.service unit shipped via the os-services-systemd contract.
-if ! command -v ollama >/dev/null 2>&1; then
-	curl -fsSL https://ollama.com/install.sh | sh
-	systemctl disable --now ollama.service 2>/dev/null || true
-fi
+# Every check below exits 1 on a host this step has already stopped, which is an outage
+# on a machine that was serving. The restore is named here, beside the failures, because
+# the failure text is what a person reads at 03:00.
+restoreHint="the model service is down. Restore it by writing MDCI_MODEL_RUNTIME=ollama to /etc/mdci-llm-runtime.env and running: systemctl restart mdci-llm.service"
 
 # the unit was synced + enabled by the ubuntu floor's os-services-systemd step
 systemctl daemon-reload
-systemctl enable --now mdci-llm.service
 
-# Wait for the daemon's loopback API to answer, then pull the model so the
-# machine is actually usable — not a manual post-deploy step. The pull is a
-# large download; it is retried a few times so a transient network drop does
-# not leave the machine with a running daemon and no model.
-MODEL_TAG="${MDCI_MODEL:?MDCI_MODEL must name the model tag to pull (the instance sets it)}"
-for i in $(seq 1 60); do
-	if curl -fsS http://127.0.0.1:11434/api/version >/dev/null 2>&1; then break; fi
-	sleep 2
-done
-if ! curl -fsS http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
-	echo "ERROR: mdci-llm daemon did not answer on 127.0.0.1:11434 — cannot pull the model" >&2
+case "${MDCI_MODEL_RUNTIME:-ollama}" in
+
+ollama)
+	install -d -o "$MODEL_USER" -g "$MODEL_USER" -m 750 "${MODEL_HOME}/models"
+
+	# Ollama is the reference daemon. Its own ollama.service is disabled in favour of
+	# the mdci-llm.service unit shipped via the os-services-systemd contract.
+	if ! command -v ollama >/dev/null 2>&1; then
+		curl -fsSL https://ollama.com/install.sh | sh
+		systemctl disable --now ollama.service 2>/dev/null || true
+	fi
+
+	MODEL_TAG="${MDCI_MODEL:?MDCI_MODEL must name the model tag to pull (the instance sets it)}"
+	printf '%s\n' \
+		MDCI_MODEL_RUNTIME=ollama \
+		"MDCI_MODEL_ROOT=${MODEL_HOME}/models" \
+		"MDCI_MODEL_ADDR=${MODEL_ADDR}" \
+		"MDCI_MODEL_SERVED_NAME=${MODEL_TAG}" > /etc/mdci-llm-runtime.env
+	chmod 644 /etc/mdci-llm-runtime.env
+
+	systemctl enable --now mdci-llm.service
+
+	# Wait for the daemon's loopback API to answer, then pull the model so the
+	# machine is actually usable — not a manual post-deploy step. The pull is a
+	# large download; it is retried a few times so a transient network drop does
+	# not leave the machine with a running daemon and no model.
+	for i in $(seq 1 60); do
+		if curl -fsS "http://${MODEL_ADDR}/api/version" >/dev/null 2>&1; then break; fi
+		sleep 2
+	done
+	if ! curl -fsS "http://${MODEL_ADDR}/api/version" >/dev/null 2>&1; then
+		echo "ERROR: mdci-llm daemon did not answer on ${MODEL_ADDR} — cannot pull the model" >&2
+		exit 1
+	fi
+	for attempt in 1 2 3; do
+		if sudo -u "$MODEL_USER" ollama pull "$MODEL_TAG"; then break; fi
+		echo "WARNING: ollama pull '$MODEL_TAG' attempt $attempt failed — retrying" >&2
+		sleep 10
+		[ "$attempt" -lt 3 ] || { echo "ERROR: could not pull the model '$MODEL_TAG'" >&2; exit 1; }
+	done
+	;;
+
+vllm)
+	# The runtime build and the checkpoint are both pinned, and the window is asked for
+	# rather than defaulted: a floating build, revision or window reaches a different
+	# state a month later, so an absent value is an error and never a fallback.
+	: "${MDCI_VLLM_VERSION:?MDCI_VLLM_VERSION must name the vllm build to install}"
+	: "${MDCI_MODEL_REVISION:?MDCI_MODEL_REVISION must name the checkpoint commit sha}"
+	: "${MDCI_MODEL_MAX_LEN:?MDCI_MODEL_MAX_LEN must name the served window}"
+	: "${MDCI_MODEL_SERVED_NAME:?MDCI_MODEL_SERVED_NAME must name the id the server answers as}"
+	SERVED_NAME="${MDCI_MODEL_SERVED_NAME}"
+
+	# The virtual environment sits in a directory of its own, never in a weights root.
+	VENV="${MODEL_HOME}/vllm/venv"
+	WEIGHTS="${MODEL_HOME}/model-repo/${MDCI_MODEL_REVISION}"
+	install -d -o "$MODEL_USER" -g "$MODEL_USER" -m 750 "${MODEL_HOME}/vllm" "${MODEL_HOME}/model-repo" "${WEIGHTS}"
+
+	apt-get install --no-install-recommends -y python3-venv python3-pip jq
+	if [ ! -x "${VENV}/bin/pip" ]; then
+		python3 -m venv "${VENV}"
+	fi
+	# A venv left at another build must not survive a changed pin, so the installed
+	# build is recorded beside it and the install repeats whenever the pin differs.
+	if [ "$(cat "${MODEL_HOME}/vllm/installed-version" 2>/dev/null)" != "${MDCI_VLLM_VERSION}" ]; then
+		"${VENV}/bin/pip" install --upgrade pip wheel
+		"${VENV}/bin/pip" install --upgrade "vllm[b12x]==${MDCI_VLLM_VERSION}"
+		printf '%s\n' "${MDCI_VLLM_VERSION}" > "${MODEL_HOME}/vllm/installed-version"
+	fi
+
+	# Download at the pinned revision, resuming what a failed run left, and verify every
+	# file before it is named. A mismatch deletes and fails. MDCI_MODEL_CACHE names a
+	# directory already holding this revision, so a second host on this machine copies
+	# instead of spending another download.
+	BASE_URL="https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4/resolve/${MDCI_MODEL_REVISION}"
+	while read -r wantSha wantSize wantPath; do
+		case "${wantSha}" in
+			'' | '#'*) continue ;;
+		esac
+		dest="${WEIGHTS}/${wantPath}"
+		if [ -f "${dest}" ] && [ "$(sha256sum "${dest}" | cut -d' ' -f1)" = "${wantSha}" ]; then
+			continue
+		fi
+		if [ -n "${MDCI_MODEL_CACHE:-}" ] && [ -f "${MDCI_MODEL_CACHE}/${wantPath}" ] \
+			&& [ "$(sha256sum "${MDCI_MODEL_CACHE}/${wantPath}" | cut -d' ' -f1)" = "${wantSha}" ]; then
+			cp "${MDCI_MODEL_CACHE}/${wantPath}" "${dest}"
+			chown "${MODEL_USER}:${MODEL_USER}" "${dest}"
+			chmod 644 "${dest}"
+			echo "daemon: ${wantPath} copied from the cache at ${MDCI_MODEL_CACHE}" >&2
+			continue
+		fi
+		for attempt in 1 2 3; do
+			if curl -fL --proto '=https' --retry 5 --retry-delay 5 -C - -o "${dest}.part" "${BASE_URL}/${wantPath}"; then break; fi
+			echo "WARNING: daemon: ${wantPath} attempt $attempt failed — resuming" >&2
+			sleep 10
+			[ "$attempt" -lt 3 ] || { echo "ERROR: daemon: could not download ${wantPath}" >&2; exit 1; }
+		done
+		gotSha="$(sha256sum "${dest}.part" | cut -d' ' -f1)"
+		if [ "${gotSha}" != "${wantSha}" ]; then
+			rm -f "${dest}.part"
+			echo "ERROR: daemon: ${wantPath} sha256 ${gotSha} is not ${wantSha}" >&2
+			exit 1
+		fi
+		chown "${MODEL_USER}:${MODEL_USER}" "${dest}.part"
+		chmod 644 "${dest}.part"
+		mv "${dest}.part" "${dest}"
+	done < "${RUNTIME_FILES}/nvfp4-checkpoint.manifest"
+
+	printf '%s\n' \
+		MDCI_MODEL_RUNTIME=vllm \
+		"MDCI_MODEL_ROOT=${WEIGHTS}" \
+		"MDCI_MODEL_ADDR=${MODEL_ADDR}" \
+		"MDCI_MODEL_SERVED_NAME=${SERVED_NAME}" \
+		"MDCI_MODEL_MAX_LEN=${MDCI_MODEL_MAX_LEN}" \
+		"MDCI_VLLM_VENV=${VENV}" \
+		MDCI_VLLM_LINEAR_BACKEND=b12x \
+		MDCI_VLLM_GPU_UTIL=0.85 \
+		MDCI_VLLM_KV_CACHE_DTYPE=fp8 > /etc/mdci-llm-runtime.env
+	chmod 644 /etc/mdci-llm-runtime.env
+
+	systemctl enable --now mdci-llm.service
+
+	for i in $(seq 1 120); do
+		if curl -fsS "http://${MODEL_ADDR}/v1/models" >/dev/null 2>&1; then break; fi
+		sleep 5
+	done
+	if ! curl -fsS "http://${MODEL_ADDR}/v1/models" >/dev/null 2>&1; then
+		echo "ERROR: daemon: vLLM did not answer on ${MODEL_ADDR}" >&2
+		echo "${restoreHint}" >&2
+		exit 1
+	fi
+
+	# A kernel that computes wrongly answers cleanly, so a reply alone proves nothing.
+	# The log must name a b12x NVFP4 kernel and no marlin or cutlass one, which on
+	# compute 12x produce wrong numbers rather than an error. The read starts at this
+	# start, never the whole journal: an earlier start's lines would pass or fail this
+	# install for a choice it never made.
+	startStamp="$(systemctl show -p ActiveEnterTimestamp --value mdci-llm.service)"
+	serveLog="$(journalctl -u mdci-llm.service --no-pager --since "${startStamp}" 2>/dev/null || true)"
+	printf '%s' "${serveLog}" | grep -aq 'B12xNvFp4LinearKernel' || {
+		echo "ERROR: daemon: the serve log names no B12xNvFp4LinearKernel for NVFP4" >&2
+		echo "${restoreHint}" >&2
+		exit 1
+	}
+	if printf '%s' "${serveLog}" | grep -aqi 'marlin\|cutlass'; then
+		printf '%s' "${serveLog}" | grep -ai 'marlin\|cutlass' >&2
+		echo "ERROR: daemon: the serve log names a marlin or cutlass kernel" >&2
+		echo "${restoreHint}" >&2
+		exit 1
+	fi
+
+	# One question whose answer is known, on wording the checkpoint cannot have
+	# memorised, since a wrong kernel produces plausible text. The thinking stays in the
+	# reply, so the comparison is on the last line after the final </think>, exactly.
+	reply="$(curl -fsS --max-time 600 "http://${MODEL_ADDR}/v1/chat/completions" \
+		-H 'Content-Type: application/json' \
+		-d "{\"model\":\"${SERVED_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"A pallet carries 19 boxes and each box holds 7 tins. Reply with the tin count as digits only.\"}],\"max_tokens\":4096}")"
+	repliedName="$(printf '%s' "${reply}" | jq -r '.model')"
+	repliedText="$(printf '%s' "${reply}" | jq -r '.choices[0].message.content')"
+	[ "${repliedName}" = "${SERVED_NAME}" ] || { echo "ERROR: daemon: the server answered as ${repliedName}, not ${SERVED_NAME}" >&2 ; echo "${restoreHint}" >&2 ; exit 1; }
+	repliedAnswer="$(printf '%s\n' "${repliedText}" | sed -e 's/.*<\/think>//' | grep -E '^[0-9]+$' | tail -1)"
+	[ "${repliedAnswer}" = 133 ] || {
+		echo "ERROR: daemon: the known answer 133 is not the reply's last digits-only line, which is '${repliedAnswer}'" >&2
+		echo "${restoreHint}" >&2
+		exit 1
+	}
+
+	# The rig sizes its request from its own family table, not from this server, so the
+	# two windows must agree. Its row for a qwen 27b is qwen*[-:_]27b* in
+	# AgentsHarnessLimits.include, and it declares 262144. A mismatch fails here rather
+	# than on the first rig run.
+	servedWindow="$(curl -fsS "http://${MODEL_ADDR}/v1/models" | jq -r --arg n "${SERVED_NAME}" '.data[] | select(.id==$n) | .max_model_len')"
+	[ "${servedWindow}" = "${MDCI_MODEL_MAX_LEN}" ] || {
+		echo "ERROR: daemon: the server reports a window of ${servedWindow}, not the ${MDCI_MODEL_MAX_LEN} this step asked for" >&2
+		echo "${restoreHint}" >&2
+		exit 1
+	}
+	case "${SERVED_NAME}" in
+		qwen*[-:_]27b*)
+			[ "${servedWindow}" = 262144 ] || {
+				echo "ERROR: daemon: the rig reads 262144 for ${SERVED_NAME} and this host serves ${servedWindow}" >&2
+				echo "${restoreHint}" >&2
+				exit 1
+			}
+			;;
+	esac
+	;;
+
+*)
+	echo "ERROR: MDCI_MODEL_RUNTIME must be ollama or vllm, not '${MDCI_MODEL_RUNTIME}'" >&2
 	exit 1
-fi
-for attempt in 1 2 3; do
-	if sudo -u "$MODEL_USER" ollama pull "$MODEL_TAG"; then break; fi
-	echo "WARNING: ollama pull '$MODEL_TAG' attempt $attempt failed — retrying" >&2
-	sleep 10
-	[ "$attempt" -lt 3 ] || { echo "ERROR: could not pull the model '$MODEL_TAG'" >&2; exit 1; }
-done
+	;;
+esac

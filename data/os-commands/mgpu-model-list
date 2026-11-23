@@ -1,3 +1,11 @@
 #!/bin/sh
-# The models currently pulled.
-curl -fsS --max-time 10 http://127.0.0.1:11434/api/tags | jq -r '.models[]?.name' 2>/dev/null
+# The models the daemon serves, whichever runtime it is.
+set -u
+[ -f /etc/mdci-llm-runtime.env ] || { echo "ERROR: /etc/mdci-llm-runtime.env is missing, so the runtime is unknown" >&2; exit 1; }
+. /etc/mdci-llm-runtime.env
+addr="${MDCI_MODEL_ADDR:-127.0.0.1:11434}"
+case "${MDCI_MODEL_RUNTIME}" in
+	ollama) curl -fsS --max-time 10 "http://${addr}/api/tags" | jq -r '.models[]?.name' 2>/dev/null ;;
+	vllm)   curl -fsS --max-time 10 "http://${addr}/v1/models" | jq -r '.data[]?.id' 2>/dev/null ;;
+	*)      echo "unknown runtime: ${MDCI_MODEL_RUNTIME}" >&2; exit 1 ;;
+esac

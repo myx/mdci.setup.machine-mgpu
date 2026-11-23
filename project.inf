@@ -16,6 +16,12 @@ Provides: \
 	\
 	image-install:context-variable:MDCI_ACCELERATOR:define:nvidia \
 	image-install:context-variable:MDCI_MODEL:define: \
+	image-install:context-variable:MDCI_MODEL_RUNTIME:define:ollama \
+	image-install:context-variable:MDCI_MODEL_SERVED_NAME:define: \
+	image-install:context-variable:MDCI_MODEL_MAX_LEN:define: \
+	image-install:context-variable:MDCI_MODEL_REVISION:define: \
+	image-install:context-variable:MDCI_MODEL_CACHE:define: \
+	image-install:context-variable:MDCI_VLLM_VERSION:define: \
 	image-install:context-variable:MDCI_MODEL_ADDR:define:127.0.0.1:11434 \
 	image-install:context-variable:MDCI_SSH_PORT:define:22022 \
 	image-install:context-variable:MDCI_GATEWAY_PORT:define:8443 \
@@ -24,7 +30,11 @@ Provides: \
 	image-install:context-variable:MDCI_API_KEY:define: \
 	image-install:context-variable:MDCI_LETSENCRYPT_EMAIL:define: \
 	image-install:context-variable:MDCI_NVIDIA_CUDA_SUITE:define:ubuntu2404 \
-	image-install:context-variable:MDCI_NVIDIA_PIN_BRANCH:define:590 \
+	image-install:context-variable:MDCI_NVIDIA_OPEN:define:1 \
+	image-install:context-variable:MDCI_NVIDIA_PIN_BRANCH:define:595 \
+	\
+	image-prepare:sync-source-files:*:data/model-runtime:model-runtime \
+	image-install:deploy-sync-files:model-runtime:/usr/local/mdci-files/model-runtime \
 	\
 	image-prepare:sync-source-files:*:data/gpu-metrics:gpu-metrics \
 	image-install:deploy-sync-files:gpu-metrics:/usr/local/mdci-files/gpu-metrics \

@@ -1,5 +1,25 @@
 #!/bin/sh
 # Pull (or update) a model. mgpu-model-pull <model-tag>
-set -e
-TAG="${1:?usage: mgpu-model-pull <model-tag>}"
-sudo -u mdci-llm ollama pull "$TAG"
+# Only the ollama runtime pulls a registry tag. The vllm runtime loads a pinned
+# checkpoint directory, so its model changes through the installer, not here.
+set -u
+# An absent runtime file is a refusal, never a default: guessing `ollama` here would
+# pull a registry tag against a daemon that serves a checkpoint.
+[ -f /etc/mdci-llm-runtime.env ] || { echo "ERROR: /etc/mdci-llm-runtime.env is missing, so the runtime is unknown" >&2; exit 1; }
+. /etc/mdci-llm-runtime.env
+case "${MDCI_MODEL_RUNTIME}" in
+	ollama)
+		set -e
+		TAG="${1:?usage: mgpu-model-pull <model-tag>}"
+		sudo -u mdci-llm ollama pull "$TAG"
+		;;
+	vllm)
+		echo "the vllm runtime serves the pinned checkpoint ${MDCI_MODEL_ROOT}" >&2
+		echo "change it with the installer's MDCI_MODEL_REVISION, not with a pull" >&2
+		exit 1
+		;;
+	*)
+		echo "unknown runtime: ${MDCI_MODEL_RUNTIME}" >&2
+		exit 1
+		;;
+esac

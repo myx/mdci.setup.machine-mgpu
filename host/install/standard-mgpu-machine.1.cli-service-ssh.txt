@@ -14,11 +14,11 @@ myx.common lib/installUser "$CLI_USER" "MDCI LLM CLI service user" 582 "${CLI_HO
 if [ -d "${CLI_SERVICE_PATH}" ]; then
 	install -m 755 "${CLI_SERVICE_PATH}/mdci-llm-cli.sh" /usr/local/bin/mdci-llm-cli.sh
 
-	# Persist the model and loopback address for the allowlist script: the SSH
-	# ForceCommand runs with a minimal environment, so the install-time values
-	# must be written to disk (as the metric collector does for the accelerator).
+	# Persist the loopback address for the allowlist script: the SSH ForceCommand runs
+	# with a minimal environment, so the install-time value must be written to disk (as
+	# the metric collector does for the accelerator). The model name is not copied here:
+	# the daemon step writes it to /etc/mdci-llm-runtime.env, which the script reads.
 	cat > /etc/mdci-llm-cli.env <<- EOF
-		MDCI_MODEL="${MDCI_MODEL:?MDCI_MODEL must name the model tag (the instance sets it)}"
 		MDCI_MODEL_ADDR="${MDCI_MODEL_ADDR:-127.0.0.1:11434}"
 	EOF
 	chmod 644 /etc/mdci-llm-cli.env

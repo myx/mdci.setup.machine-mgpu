@@ -1,0 +1,30 @@
+#!/bin/sh
+# Model-service dispatcher: the unit's one ExecStart, whichever runtime is chosen.
+set -e
+. /etc/mdci-llm-runtime.env
+
+case "${MDCI_MODEL_RUNTIME}" in
+	ollama)
+		OLLAMA_HOST="${MDCI_MODEL_ADDR}" OLLAMA_MODELS="${MDCI_MODEL_ROOT}" exec /usr/local/bin/ollama serve
+		;;
+	vllm)
+		# torch.compile runs ninja by name, and it lives in the environment's own bin.
+		PATH="${MDCI_VLLM_VENV}/bin:${PATH}"
+		export PATH
+		exec "${MDCI_VLLM_VENV}/bin/vllm" serve "${MDCI_MODEL_ROOT}" \
+			--served-model-name "${MDCI_MODEL_SERVED_NAME}" \
+			--quantization modelopt_mixed \
+			--linear-backend "${MDCI_VLLM_LINEAR_BACKEND}" \
+			--host "${MDCI_MODEL_ADDR%:*}" \
+			--port "${MDCI_MODEL_ADDR##*:}" \
+			--max-model-len "${MDCI_MODEL_MAX_LEN}" \
+			--gpu-memory-utilization "${MDCI_VLLM_GPU_UTIL}" \
+			--kv-cache-dtype "${MDCI_VLLM_KV_CACHE_DTYPE}" \
+			--enable-auto-tool-choice \
+			--tool-call-parser qwen3_coder
+		;;
+	*)
+		echo "ERROR: MDCI_MODEL_RUNTIME must be ollama or vllm, not '${MDCI_MODEL_RUNTIME}'" >&2
+		exit 1
+		;;
+esac
