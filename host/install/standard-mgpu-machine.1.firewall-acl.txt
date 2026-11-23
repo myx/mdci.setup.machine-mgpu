@@ -71,10 +71,15 @@ if [ -z "$listening" ] ; then
 fi
 rm -f "$SSHD_BACKUP"
 
-# Fill the firewall placeholders. The gateway opens only to the rig IPs; with no
-# rig IPs set, the gateway rule is removed, so the model stays unreachable.
-# The template itself is copied by a later fragment, so copy it here first: the
-# fill has nothing to act on until the placeholders exist on disk.
+# Fill the firewall placeholders. The gateway and 443 open only to the rig IPs,
+# so an empty value refuses the install rather than render a rule with no address
+# match. The template itself is copied by a later fragment, so copy it here first:
+# the fill has nothing to act on until the placeholders exist on disk.
+if [ -z "$RIG_IP" ] ; then
+	echo 'ERROR: MDCI_RIG_IP is empty, so the firewall rule would carry no address match; refusing to apply the firewall' >&2
+	exit 1
+fi
+
 NFTABLES_TEMPLATE="${MDCI_FILES_PATH:-/usr/local/mdci-files}/nftables.conf/nftables.conf"
 if [ -s "$NFTABLES_TEMPLATE" ]; then
 	cp -f "$NFTABLES_TEMPLATE" /etc/nftables.conf
@@ -83,12 +88,7 @@ if [ -s "$NFTABLES_TEMPLATE" ]; then
 fi
 
 if [ -f /etc/nftables.conf ]; then
-	sed -i -e "s|__MDCI_SSH_PORT__|${SSH_PORT}|g" -e "s|__MDCI_GATEWAY_PORT__|${GATEWAY_PORT}|g" /etc/nftables.conf
-	if [ -n "$RIG_IP" ]; then
-		sed -i -e "s|__MDCI_RIG_IP__|${RIG_IP}|g" /etc/nftables.conf
-	else
-		sed -i -e "/model API gateway/d" /etc/nftables.conf
-	fi
+	sed -i -e "s|__MDCI_SSH_PORT__|${SSH_PORT}|g" -e "s|__MDCI_GATEWAY_PORT__|${GATEWAY_PORT}|g" -e "s|__MDCI_RIG_IP__|${RIG_IP}|g" /etc/nftables.conf
 fi
 
 # A placeholder left in the file is a ruleset that will not load: refuse before
